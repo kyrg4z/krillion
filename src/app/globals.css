@@ -1,0 +1,254 @@
+@import "tailwindcss";
+
+@theme {
+  --color-void: #0a0912;
+  --color-deep: #100e1c;
+  --color-panel: #17142a;
+  --color-raised: #211c3c;
+  --color-edge: #2b2550;
+  --color-ink: #ece9fb;
+  --color-dim: #9a93bf;
+  --color-faint: #5f5885;
+  --color-signal: #ffb454;
+  --color-true: #57e0b0;
+  --color-false: #ff5f7e;
+
+  --font-display: var(--font-bricolage), ui-sans-serif, system-ui, sans-serif;
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+
+  --ease-out-soft: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+:root {
+  color-scheme: dark;
+  /* Category accent, overridden per screen. */
+  --cat: 268;
+  --accent: hsl(var(--cat) 90% 68%);
+  --accent-soft: hsl(var(--cat) 80% 68% / 0.16);
+}
+
+html {
+  background: var(--color-void);
+}
+
+body {
+  min-height: 100dvh;
+  background:
+    radial-gradient(1100px 620px at 12% -10%, hsl(var(--cat) 70% 30% / 0.24), transparent 70%),
+    radial-gradient(900px 540px at 100% 4%, hsl(calc(var(--cat) + 48) 65% 28% / 0.16), transparent 68%),
+    var(--color-void);
+  background-attachment: fixed;
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-feature-settings: "tnum" 1, "cv05" 1;
+  -webkit-font-smoothing: antialiased;
+  transition: --cat 600ms linear;
+}
+
+::selection {
+  background: var(--accent-soft);
+  color: var(--color-ink);
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 6px;
+}
+
+/* --- Panels ------------------------------------------------------------- */
+
+.panel {
+  background: linear-gradient(168deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.012));
+  border: 1px solid var(--color-edge);
+  border-radius: 22px;
+  backdrop-filter: blur(14px);
+}
+
+.hairline {
+  border-top: 1px solid var(--color-edge);
+}
+
+/* --- Option rows -------------------------------------------------------- */
+
+.choice {
+  position: relative;
+  display: grid;
+  grid-template-columns: 2.25rem 1fr;
+  align-items: center;
+  gap: 0.75rem;
+  width: 100%;
+  padding: 0.95rem 1.1rem;
+  text-align: left;
+  border-radius: 14px;
+  border: 1px solid var(--color-edge);
+  background: rgba(255, 255, 255, 0.022);
+  color: var(--color-ink);
+  font-size: 1.0625rem;
+  line-height: 1.45;
+  transition:
+    border-color 180ms var(--ease-out-soft),
+    background-color 180ms var(--ease-out-soft),
+    transform 180ms var(--ease-out-soft);
+}
+
+.choice:hover:not(:disabled) {
+  border-color: hsl(var(--cat) 80% 70% / 0.55);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.choice:active:not(:disabled) {
+  transform: scale(0.994);
+}
+
+.choice-key {
+  display: grid;
+  place-items: center;
+  width: 2.25rem;
+  height: 2.25rem;
+  border-radius: 9px;
+  border: 1px solid var(--color-edge);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--color-faint);
+  font-size: 0.8125rem;
+  font-variant-numeric: tabular-nums;
+  transition: color 180ms, border-color 180ms, background-color 180ms;
+}
+
+.choice:hover:not(:disabled) .choice-key {
+  color: var(--accent);
+  border-color: hsl(var(--cat) 80% 70% / 0.5);
+}
+
+.choice[data-state="right"] {
+  border-color: color-mix(in oklab, var(--color-true) 70%, transparent);
+  background: color-mix(in oklab, var(--color-true) 13%, transparent);
+}
+
+.choice[data-state="right"] .choice-key {
+  color: var(--color-true);
+  border-color: color-mix(in oklab, var(--color-true) 55%, transparent);
+}
+
+.choice[data-state="wrong"] {
+  border-color: color-mix(in oklab, var(--color-false) 65%, transparent);
+  background: color-mix(in oklab, var(--color-false) 11%, transparent);
+}
+
+.choice[data-state="wrong"] .choice-key {
+  color: var(--color-false);
+  border-color: color-mix(in oklab, var(--color-false) 50%, transparent);
+}
+
+.choice[data-state="muted"] {
+  opacity: 0.4;
+}
+
+/* --- The signal line: the one piece of motion that carries the game ------ */
+
+.signal-wrap {
+  position: relative;
+  height: 46px;
+  overflow: hidden;
+  mask-image: linear-gradient(90deg, transparent, #000 8%, #000 92%, transparent);
+}
+
+.signal-line {
+  stroke: hsl(var(--cat) 85% 70% / 0.55);
+  stroke-width: 1.6;
+  fill: none;
+  transition: stroke 400ms var(--ease-out-soft), d 700ms var(--ease-out-soft);
+}
+
+.signal-line[data-pulse="right"] {
+  stroke: var(--color-true);
+}
+
+.signal-line[data-pulse="wrong"] {
+  stroke: var(--color-false);
+}
+
+.signal-sweep {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, hsl(var(--cat) 90% 75% / 0.22), transparent);
+  width: 34%;
+  animation: sweep 5.5s linear infinite;
+}
+
+@keyframes sweep {
+  from { transform: translateX(-120%); }
+  to { transform: translateX(420%); }
+}
+
+/* --- Timer beam --------------------------------------------------------- */
+
+.beam {
+  height: 2px;
+  background: var(--color-edge);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.beam > i {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, hsl(var(--cat) 88% 60%), hsl(var(--cat) 96% 76%));
+  transform-origin: left;
+  transition: transform 220ms linear, background 300ms;
+}
+
+.beam[data-urgent="true"] > i {
+  background: linear-gradient(90deg, var(--color-signal), var(--color-false));
+}
+
+/* --- Ambient tint, so the room takes the colour of the subject ----------- */
+
+.tint-field {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(1100px 620px at 12% -8%, hsl(var(--cat) 70% 32% / 0.3), transparent 70%),
+    radial-gradient(900px 540px at 100% 6%, hsl(calc(var(--cat) + 48) 65% 30% / 0.2), transparent 68%);
+}
+
+/* --- Entrances ---------------------------------------------------------- */
+
+@keyframes rise {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: none; }
+}
+
+.rise {
+  animation: rise 420ms var(--ease-out-soft) both;
+}
+
+@keyframes count-flash {
+  0% { transform: translateY(6px) scale(0.96); opacity: 0; }
+  60% { transform: translateY(0) scale(1.04); opacity: 1; }
+  100% { transform: none; opacity: 1; }
+}
+
+.flash {
+  animation: count-flash 520ms var(--ease-out-soft) both;
+}
+
+.tick {
+  height: 3px;
+  border-radius: 999px;
+  background: var(--color-edge);
+  transition: background-color 260ms var(--ease-out-soft), flex-grow 320ms var(--ease-out-soft);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+  .signal-sweep { display: none; }
+}
