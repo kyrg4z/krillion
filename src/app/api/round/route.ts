@@ -11,13 +11,13 @@ export async function POST(request: Request) {
       mode?: Mode; category?: CategoryId; sourceId?: string; length?: number;
     };
     const mode = body.mode ?? "mixed";
-    const { sessionId, length } = startSession({
+    const { sessionId, length } = await startSession({
       mode,
       category: body.category ?? null,
       sourceId: body.sourceId ?? null,
       length: body.length,
     });
-    return NextResponse.json({ sessionId, length, question: serveQuestion(sessionId, 0) });
+    return NextResponse.json({ sessionId, length, question: await serveQuestion(sessionId, 0) });
   } catch (error) {
     return NextResponse.json({ error: (error as Error).message }, { status: 400 });
   }

@@ -6,11 +6,11 @@ export const dynamic = "force-dynamic";
 
 export async function GET() {
   return NextResponse.json({
-    overview: overview(),
-    categories: categoryStats(),
-    weak: topicStats("weak"),
-    strong: topicStats("strong"),
-    recent: recentSessions(),
-    activity: activity(),
+    overview: await overview(),
+    categories: await categoryStats(),
+    weak: await topicStats("weak"),
+    strong: await topicStats("strong"),
+    recent: await recentSessions(),
+    activity: await activity(),
   });
 }

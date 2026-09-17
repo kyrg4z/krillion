@@ -9,11 +9,11 @@ import { tint } from "@/lib/tint";
 export const dynamic = "force-dynamic";
 
 export default async function Home() {
-  const stats = overview();
-  const categories = categoryStats();
-  const weak = topicStats("weak", 3);
-  const hasWeak = weakTopicAvailable();
-  const sources = listSources();
+  const stats = await overview();
+  const categories = await categoryStats();
+  const weak = await topicStats("weak", 3);
+  const hasWeak = await weakTopicAvailable();
+  const sources = await listSources();
 
   return (
     <main className="mx-auto w-full max-w-5xl px-4 pb-24 sm:px-6">

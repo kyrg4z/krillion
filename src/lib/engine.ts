@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { db } from "./db";
+import { all, get, tx, type Tx } from "./db";
 import { ready } from "./seed-loader";
 import { categoryName } from "./categories";
 import { hashSeed, mulberry32, shuffle, todayKey } from "./rng";
@@ -52,21 +52,16 @@ function candidateSql(where: string): string {
   `;
 }
 
-function loadCandidates(opts: StartOptions): CandidateRow[] {
-  const conn = db();
+async function loadCandidates(opts: StartOptions): Promise<CandidateRow[]> {
   if (opts.mode === "source" && opts.sourceId) {
-    return conn.prepare(candidateSql("WHERE q.source_id = ?")).all(opts.sourceId) as CandidateRow[];
+    return all<CandidateRow>(candidateSql("WHERE q.source_id = ?"), [opts.sourceId]);
   }
   if (opts.mode === "category" && opts.category) {
-    return conn
-      .prepare(candidateSql("WHERE q.category = ? AND q.source_id IS NULL"))
-      .all(opts.category) as CandidateRow[];
+    return all<CandidateRow>(candidateSql("WHERE q.category = ? AND q.source_id IS NULL"), [opts.category]);
   }
   // Imported material joins mixed and weak-topic rounds; the curated modes stay curated.
   const includeImported = opts.mode === "mixed" || opts.mode === "weak";
-  return conn
-    .prepare(candidateSql(includeImported ? "" : "WHERE q.source_id IS NULL"))
-    .all() as CandidateRow[];
+  return all<CandidateRow>(candidateSql(includeImported ? "" : "WHERE q.source_id IS NULL"));
 }
 
 /**
@@ -122,9 +117,8 @@ function diversify(rows: CandidateRow[], count: number, spreadCategories: boolea
   return picked;
 }
 
-export function startSession(opts: StartOptions): { sessionId: string; length: number } {
-  ready();
-  const conn = db();
+export async function startSession(opts: StartOptions): Promise<{ sessionId: string; length: number }> {
+  await ready();
   const now = Date.now();
   const length = Math.min(ROUND_MAX, Math.max(ROUND_MIN, opts.length ?? ROUND_DEFAULT));
 
@@ -132,7 +126,7 @@ export function startSession(opts: StartOptions): { sessionId: string; length: n
   const seed = daily ? `daily:${todayKey()}` : crypto.randomUUID();
   const rand = mulberry32(hashSeed(seed));
 
-  const rows = loadCandidates(opts);
+  const rows = await loadCandidates(opts);
   if (rows.length === 0) throw new Error("No questions available for that selection.");
 
   let ordered: CandidateRow[];
@@ -148,43 +142,43 @@ export function startSession(opts: StartOptions): { sessionId: string; length: n
   picked.sort((a, b) => a.difficulty - b.difficulty);
 
   const sessionId = crypto.randomUUID();
-  const insertSession = conn.prepare(`
-    INSERT INTO sessions (id, mode, category, source_id, seed, length, started_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `);
-  const insertQueue = conn.prepare(`
-    INSERT INTO session_queue (session_id, idx, question_id, layout) VALUES (?, ?, ?, ?)
-  `);
 
-  conn.transaction(() => {
-    insertSession.run(sessionId, opts.mode, opts.category ?? null, opts.sourceId ?? null, seed, picked.length, now);
-    picked.forEach((row, idx) => {
+  await tx(async (t) => {
+    await t.run(
+      `INSERT INTO sessions (id, mode, category, source_id, seed, length, started_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [sessionId, opts.mode, opts.category ?? null, opts.sourceId ?? null, seed, picked.length, now],
+    );
+    for (const [idx, row] of picked.entries()) {
       const optionCount = (JSON.parse(row.options) as string[]).length;
       const layout = shuffle(
         Array.from({ length: optionCount }, (_, i) => i),
         mulberry32(hashSeed(`${sessionId}:${row.id}`)),
       );
-      insertQueue.run(sessionId, idx, row.id, JSON.stringify(layout));
-    });
-  })();
+      await t.run("INSERT INTO session_queue (session_id, idx, question_id, layout) VALUES (?, ?, ?, ?)", [
+        sessionId,
+        idx,
+        row.id,
+        JSON.stringify(layout),
+      ]);
+    }
+  });
 
   return { sessionId, length: picked.length };
 }
 
 function queueRow(sessionId: string, idx: number) {
-  const row = db()
-    .prepare(
-      `SELECT sq.idx, sq.question_id, sq.layout, sq.answered_at, q.*
-       FROM session_queue sq JOIN questions q ON q.id = sq.question_id
-       WHERE sq.session_id = ? AND sq.idx = ?`,
-    )
-    .get(sessionId, idx) as (QuestionRow & { layout: string; answered_at: number | null }) | undefined;
-  return row;
+  return get<QuestionRow & { layout: string; answered_at: number | null }>(
+    `SELECT sq.idx, sq.question_id, sq.layout, sq.answered_at, q.*
+     FROM session_queue sq JOIN questions q ON q.id = sq.question_id
+     WHERE sq.session_id = ? AND sq.idx = ?`,
+    [sessionId, idx],
+  );
 }
 
-export function serveQuestion(sessionId: string, idx: number): ServedQuestion | null {
-  ready();
-  const row = queueRow(sessionId, idx);
+export async function serveQuestion(sessionId: string, idx: number): Promise<ServedQuestion | null> {
+  await ready();
+  const row = await queueRow(sessionId, idx);
   if (!row) return null;
   const options = JSON.parse(row.options) as string[];
   const layout = JSON.parse(row.layout) as number[];
@@ -210,11 +204,16 @@ function scoreFor(difficulty: number, ms: number, streak: number): number {
   return Math.round((base + speed) * multiplier);
 }
 
-function updateQuestionState(questionId: string, correct: boolean, ms: number, now: number): void {
-  const conn = db();
-  const prior = conn.prepare("SELECT * FROM question_state WHERE question_id = ?").get(questionId) as
-    | { seen: number; correct: number; lapses: number; interval_h: number; ease: number; best_ms: number | null }
-    | undefined;
+async function updateQuestionState(
+  t: Tx,
+  questionId: string,
+  correct: boolean,
+  ms: number,
+  now: number,
+): Promise<void> {
+  const prior = await t.get<{
+    seen: number; correct: number; lapses: number; interval_h: number; ease: number; best_ms: number | null;
+  }>("SELECT * FROM question_state WHERE question_id = ?", [questionId]);
 
   const ease = prior?.ease ?? 2.3;
   const intervalH = prior?.interval_h ?? 0;
@@ -222,21 +221,19 @@ function updateQuestionState(questionId: string, correct: boolean, ms: number, n
   const nextInterval = correct ? (intervalH === 0 ? 20 : intervalH * nextEase) : 4;
   const bestMs = correct ? Math.min(prior?.best_ms ?? ms, ms) : (prior?.best_ms ?? null);
 
-  conn
-    .prepare(
-      `INSERT INTO question_state (question_id, seen, correct, lapses, last_seen, next_due, interval_h, ease, best_ms)
-       VALUES (@id, 1, @correct, @lapse, @now, @due, @interval, @ease, @best)
-       ON CONFLICT(question_id) DO UPDATE SET
-         seen = seen + 1,
-         correct = correct + @correct,
-         lapses = lapses + @lapse,
-         last_seen = @now,
-         next_due = @due,
-         interval_h = @interval,
-         ease = @ease,
-         best_ms = @best`,
-    )
-    .run({
+  await t.run(
+    `INSERT INTO question_state (question_id, seen, correct, lapses, last_seen, next_due, interval_h, ease, best_ms)
+     VALUES (@id, 1, @correct, @lapse, @now, @due, @interval, @ease, @best)
+     ON CONFLICT(question_id) DO UPDATE SET
+       seen = seen + 1,
+       correct = correct + @correct,
+       lapses = lapses + @lapse,
+       last_seen = @now,
+       next_due = @due,
+       interval_h = @interval,
+       ease = @ease,
+       best_ms = @best`,
+    {
       id: questionId,
       correct: correct ? 1 : 0,
       lapse: correct ? 0 : 1,
@@ -245,42 +242,45 @@ function updateQuestionState(questionId: string, correct: boolean, ms: number, n
       interval: nextInterval,
       ease: nextEase,
       best: bestMs,
-    });
+    },
+  );
 }
 
-function updateMastery(category: string, topic: string, correct: boolean, ms: number, now: number): void {
+async function updateMastery(
+  t: Tx,
+  category: string,
+  topic: string,
+  correct: boolean,
+  ms: number,
+  now: number,
+): Promise<void> {
   const key = `${category}::${topic}`;
-  const conn = db();
-  const prior = conn.prepare("SELECT strength FROM mastery WHERE key = ?").get(key) as
-    | { strength: number }
-    | undefined;
+  const prior = await t.get<{ strength: number }>("SELECT strength FROM mastery WHERE key = ?", [key]);
   const alpha = 0.3;
   const quality = correct ? (ms < 8000 ? 1 : 0.9) : 0;
   const strength = (prior?.strength ?? 0.5) * (1 - alpha) + quality * alpha;
 
-  conn
-    .prepare(
-      `INSERT INTO mastery (key, category, topic, seen, correct, total_ms, strength, last_seen)
-       VALUES (@key, @category, @topic, 1, @correct, @ms, @strength, @now)
-       ON CONFLICT(key) DO UPDATE SET
-         seen = seen + 1,
-         correct = correct + @correct,
-         total_ms = total_ms + @ms,
-         strength = @strength,
-         last_seen = @now`,
-    )
-    .run({ key, category, topic, correct: correct ? 1 : 0, ms, strength, now });
+  await t.run(
+    `INSERT INTO mastery (key, category, topic, seen, correct, total_ms, strength, last_seen)
+     VALUES (@key, @category, @topic, 1, @correct, @ms, @strength, @now)
+     ON CONFLICT(key) DO UPDATE SET
+       seen = seen + 1,
+       correct = correct + @correct,
+       total_ms = total_ms + @ms,
+       strength = @strength,
+       last_seen = @now`,
+    { key, category, topic, correct: correct ? 1 : 0, ms, strength, now },
+  );
 }
 
-export function answerQuestion(
+export async function answerQuestion(
   sessionId: string,
   idx: number,
   given: string,
   ms: number,
-): AnswerResult {
-  ready();
-  const conn = db();
-  const row = queueRow(sessionId, idx);
+): Promise<AnswerResult> {
+  await ready();
+  const row = await queueRow(sessionId, idx);
   if (!row) throw new Error("Question not found in this round.");
 
   const options = JSON.parse(row.options) as string[];
@@ -302,36 +302,39 @@ export function answerQuestion(
     correct = answerMatches(given, row.answer, JSON.parse(row.aliases) as string[]);
   }
 
-  const session = conn.prepare("SELECT * FROM sessions WHERE id = ?").get(sessionId) as {
+  const session = await get<{
     total: number; correct: number; score: number; best_streak: number; avg_ms: number;
-  };
-  const priorStreak = currentStreak(sessionId);
+  }>("SELECT * FROM sessions WHERE id = ?", [sessionId]);
+  if (!session) throw new Error("Unknown round.");
+  const priorStreak = await currentStreak(sessionId);
   const streak = correct ? priorStreak + 1 : 0;
   const points = correct ? scoreFor(row.difficulty, clampedMs, priorStreak) : 0;
   const now = Date.now();
 
-  conn.transaction(() => {
-    if (row.answered_at == null) {
-      conn.prepare("UPDATE session_queue SET answered_at = ? WHERE session_id = ? AND idx = ?").run(now, sessionId, idx);
-      conn
-        .prepare(
-          `INSERT INTO attempts (session_id, question_id, category, topic, difficulty, level, correct, ms, given, points, at)
-           VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`,
-        )
-        .run(sessionId, row.id, row.category, row.topic, row.difficulty, correct ? 1 : 0, clampedMs, given, points, now);
+  if (row.answered_at == null) {
+    await tx(async (t) => {
+      await t.run("UPDATE session_queue SET answered_at = ? WHERE session_id = ? AND idx = ?", [now, sessionId, idx]);
+      await t.run(
+        `INSERT INTO attempts (session_id, question_id, category, topic, difficulty, level, correct, ms, given, points, at)
+         VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`,
+        [sessionId, row.id, row.category, row.topic, row.difficulty, correct ? 1 : 0, clampedMs, given, points, now],
+      );
 
       const total = session.total + 1;
       const avgMs = Math.round((session.avg_ms * session.total + clampedMs) / total);
-      conn
-        .prepare(
-          `UPDATE sessions SET total = ?, correct = ?, score = ?, best_streak = ?, avg_ms = ? WHERE id = ?`,
-        )
-        .run(total, session.correct + (correct ? 1 : 0), session.score + points, Math.max(session.best_streak, streak), avgMs, sessionId);
+      await t.run("UPDATE sessions SET total = ?, correct = ?, score = ?, best_streak = ?, avg_ms = ? WHERE id = ?", [
+        total,
+        session.correct + (correct ? 1 : 0),
+        session.score + points,
+        Math.max(session.best_streak, streak),
+        avgMs,
+        sessionId,
+      ]);
 
-      updateQuestionState(row.id, correct, clampedMs, now);
-      updateMastery(row.category, row.topic, correct, clampedMs, now);
-    }
-  })();
+      await updateQuestionState(t, row.id, correct, clampedMs, now);
+      await updateMastery(t, row.category, row.topic, correct, clampedMs, now);
+    });
+  }
 
   return {
     correct,
@@ -344,10 +347,11 @@ export function answerQuestion(
   };
 }
 
-function currentStreak(sessionId: string): number {
-  const rows = db()
-    .prepare("SELECT correct FROM attempts WHERE session_id = ? AND level = 1 ORDER BY id DESC LIMIT 20")
-    .all(sessionId) as { correct: number }[];
+async function currentStreak(sessionId: string): Promise<number> {
+  const rows = await all<{ correct: number }>(
+    "SELECT correct FROM attempts WHERE session_id = ? AND level = 1 ORDER BY id DESC LIMIT 20",
+    [sessionId],
+  );
   let streak = 0;
   for (const r of rows) {
     if (r.correct) streak++;
@@ -356,9 +360,9 @@ function currentStreak(sessionId: string): number {
   return streak;
 }
 
-export function serveDeeper(sessionId: string, idx: number, step: number) {
-  ready();
-  const row = queueRow(sessionId, idx);
+export async function serveDeeper(sessionId: string, idx: number, step: number) {
+  await ready();
+  const row = await queueRow(sessionId, idx);
   if (!row) return null;
   const steps = JSON.parse(row.deeper) as DeeperStep[];
   const chosen = steps[step];
@@ -376,10 +380,9 @@ export function serveDeeper(sessionId: string, idx: number, step: number) {
   };
 }
 
-export function answerDeeper(sessionId: string, idx: number, step: number, given: number, ms: number) {
-  ready();
-  const conn = db();
-  const row = queueRow(sessionId, idx);
+export async function answerDeeper(sessionId: string, idx: number, step: number, given: number, ms: number) {
+  await ready();
+  const row = await queueRow(sessionId, idx);
   if (!row) throw new Error("Question not found in this round.");
   const steps = JSON.parse(row.deeper) as DeeperStep[];
   const chosen = steps[step];
@@ -395,16 +398,15 @@ export function answerDeeper(sessionId: string, idx: number, step: number, given
   const now = Date.now();
   const clampedMs = Math.max(200, Math.min(ms, 120_000));
 
-  conn.transaction(() => {
-    conn
-      .prepare(
-        `INSERT INTO attempts (session_id, question_id, category, topic, difficulty, level, correct, ms, given, points, at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(sessionId, row.id, row.category, row.topic, row.difficulty, chosen.level, correct ? 1 : 0, clampedMs, String(given), points, now);
-    conn.prepare("UPDATE sessions SET score = score + ? WHERE id = ?").run(points, sessionId);
-    updateMastery(row.category, row.topic, correct, clampedMs, now);
-  })();
+  await tx(async (t) => {
+    await t.run(
+      `INSERT INTO attempts (session_id, question_id, category, topic, difficulty, level, correct, ms, given, points, at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [sessionId, row.id, row.category, row.topic, row.difficulty, chosen.level, correct ? 1 : 0, clampedMs, String(given), points, now],
+    );
+    await t.run("UPDATE sessions SET score = score + ? WHERE id = ?", [points, sessionId]);
+    await updateMastery(t, row.category, row.topic, correct, clampedMs, now);
+  });
 
   return {
     correct,
@@ -440,55 +442,55 @@ export function levelFromXp(xp: number): { level: number; progress: number; next
   return { level, progress: next === current ? 0 : (xp - current) / (next - current), nextAt: next };
 }
 
-export function finishSession(sessionId: string): SessionSummary {
-  ready();
-  const conn = db();
-  const session = conn.prepare("SELECT * FROM sessions WHERE id = ?").get(sessionId) as {
+export async function finishSession(sessionId: string): Promise<SessionSummary> {
+  await ready();
+  const session = await get<{
     id: string; mode: Mode; category: string | null; total: number; correct: number;
     score: number; best_streak: number; avg_ms: number; ended_at: number | null; seed: string;
-  };
+  }>("SELECT * FROM sessions WHERE id = ?", [sessionId]);
   if (!session) throw new Error("Unknown round.");
 
   const now = Date.now();
   if (session.ended_at == null) {
-    conn.transaction(() => {
-      conn.prepare("UPDATE sessions SET ended_at = ? WHERE id = ?").run(now, sessionId);
+    await tx(async (t) => {
+      await t.run("UPDATE sessions SET ended_at = ? WHERE id = ?", [now, sessionId]);
       const gainedXp = Math.round(session.score / 5);
-      conn
-        .prepare("UPDATE profile SET xp = xp + ?, games = games + 1, best_streak = MAX(best_streak, ?) WHERE id = 1")
-        .run(gainedXp, session.best_streak);
+      await t.run(
+        "UPDATE profile SET xp = xp + ?, games = games + 1, best_streak = MAX(best_streak, ?) WHERE id = 1",
+        [gainedXp, session.best_streak],
+      );
 
       if (session.mode === "daily") {
         const key = todayKey();
-        conn
-          .prepare(
-            `INSERT INTO daily (date, session_id, score, correct, total, done_at) VALUES (?, ?, ?, ?, ?, ?)
-             ON CONFLICT(date) DO UPDATE SET session_id = excluded.session_id, score = MAX(score, excluded.score),
-               correct = excluded.correct, total = excluded.total, done_at = excluded.done_at`,
-          )
-          .run(key, sessionId, session.score, session.correct, session.total, now);
-        bumpDailyStreak(key);
+        await t.run(
+          `INSERT INTO daily (date, session_id, score, correct, total, done_at) VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(date) DO UPDATE SET session_id = excluded.session_id, score = MAX(score, excluded.score),
+             correct = excluded.correct, total = excluded.total, done_at = excluded.done_at`,
+          [key, sessionId, session.score, session.correct, session.total, now],
+        );
+        await bumpDailyStreak(t, key);
       }
-    })();
+    });
   }
 
-  const profile = conn.prepare("SELECT xp FROM profile WHERE id = 1").get() as { xp: number };
-  const { level, progress } = levelFromXp(profile.xp);
+  const profile = await get<{ xp: number }>("SELECT xp FROM profile WHERE id = 1");
+  const xp = profile?.xp ?? 0;
+  const { level, progress } = levelFromXp(xp);
 
-  const breakdown = conn
-    .prepare(
-      `SELECT topic, category, SUM(correct) AS correct, COUNT(*) AS total
-       FROM attempts WHERE session_id = ? AND level = 1 GROUP BY category, topic ORDER BY total DESC`,
-    )
-    .all(sessionId) as { topic: string; category: string; correct: number; total: number }[];
+  const breakdown = await all<{ topic: string; category: string; correct: number; total: number }>(
+    `SELECT topic, category, SUM(correct) AS correct, COUNT(*) AS total
+     FROM attempts WHERE session_id = ? AND level = 1 GROUP BY category, topic ORDER BY total DESC`,
+    [sessionId],
+  );
 
-  const missed = conn
-    .prepare(
-      `SELECT q.id, q.prompt, q.options, q.answer, q.explanation, q.topic
-       FROM attempts a JOIN questions q ON q.id = a.question_id
-       WHERE a.session_id = ? AND a.level = 1 AND a.correct = 0`,
-    )
-    .all(sessionId) as { id: string; prompt: string; options: string; answer: string; explanation: string; topic: string }[];
+  const missed = await all<{
+    id: string; prompt: string; options: string; answer: string; explanation: string; topic: string;
+  }>(
+    `SELECT q.id, q.prompt, q.options, q.answer, q.explanation, q.topic
+     FROM attempts a JOIN questions q ON q.id = a.question_id
+     WHERE a.session_id = ? AND a.level = 1 AND a.correct = 0`,
+    [sessionId],
+  );
 
   return {
     id: session.id,
@@ -500,7 +502,7 @@ export function finishSession(sessionId: string): SessionSummary {
     bestStreak: session.best_streak,
     avgMs: session.avg_ms,
     accuracy: session.total ? session.correct / session.total : 0,
-    xp: profile.xp,
+    xp,
     level,
     levelProgress: progress,
     breakdown,
@@ -514,21 +516,20 @@ export function finishSession(sessionId: string): SessionSummary {
   };
 }
 
-function bumpDailyStreak(dateKey: string): void {
-  const conn = db();
-  const profile = conn.prepare("SELECT daily_streak, last_daily FROM profile WHERE id = 1").get() as {
-    daily_streak: number; last_daily: string | null;
-  };
-  if (profile.last_daily === dateKey) return;
+async function bumpDailyStreak(t: Tx, dateKey: string): Promise<void> {
+  const profile = await t.get<{ daily_streak: number; last_daily: string | null }>(
+    "SELECT daily_streak, last_daily FROM profile WHERE id = 1",
+  );
+  if (!profile || profile.last_daily === dateKey) return;
   const yesterday = new Date(`${dateKey}T12:00:00`);
   yesterday.setDate(yesterday.getDate() - 1);
   const yKey = todayKey(yesterday);
   const streak = profile.last_daily === yKey ? profile.daily_streak + 1 : 1;
-  conn.prepare("UPDATE profile SET daily_streak = ?, last_daily = ? WHERE id = 1").run(streak, dateKey);
+  await t.run("UPDATE profile SET daily_streak = ?, last_daily = ? WHERE id = 1", [streak, dateKey]);
 }
 
-export function dailyDone(): boolean {
-  ready();
-  const row = db().prepare("SELECT date FROM daily WHERE date = ?").get(todayKey());
+export async function dailyDone(): Promise<boolean> {
+  await ready();
+  const row = await get("SELECT date FROM daily WHERE date = ?", [todayKey()]);
   return Boolean(row);
 }

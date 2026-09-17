@@ -17,12 +17,12 @@ const MODE_LABEL: Record<string, string> = {
 };
 
 export default async function Stats() {
-  const stats = overview();
-  const categories = categoryStats();
-  const weak = topicStats("weak", 6);
-  const strong = topicStats("strong", 4);
-  const recent = recentSessions(6);
-  const days = activity(28);
+  const stats = await overview();
+  const categories = await categoryStats();
+  const weak = await topicStats("weak", 6);
+  const strong = await topicStats("strong", 4);
+  const recent = await recentSessions(6);
+  const days = await activity(28);
   const busiest = Math.max(1, ...days.map((d) => d.answered));
 
   return (

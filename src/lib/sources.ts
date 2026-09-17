@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { db } from "./db";
+import { all, get, run, tx } from "./db";
 import { ready } from "./seed-loader";
 import type { ExtractedSection } from "./extract";
 
@@ -57,42 +57,43 @@ export function chunkSection(section: ExtractedSection): { ref: string | null; t
   return chunks.filter((c) => c.text.length > 120);
 }
 
-export function addSource(input: {
+export async function addSource(input: {
   title: string;
   kind: string;
   filename: string | null;
   sections: ExtractedSection[];
-}): { id: string; chunks: number; chars: number } {
-  ready();
-  const conn = db();
+}): Promise<{ id: string; chunks: number; chars: number }> {
+  await ready();
   const id = crypto.randomUUID();
   const now = Date.now();
   const chunks = input.sections.flatMap(chunkSection);
   const chars = chunks.reduce((sum, c) => sum + c.text.length, 0);
 
-  const insertChunk = conn.prepare("INSERT INTO chunks (id, source_id, idx, ref, text) VALUES (?, ?, ?, ?, ?)");
-  const insertFts = conn.prepare("INSERT INTO chunks_fts (text, chunk_id, source_id) VALUES (?, ?, ?)");
-
-  conn.transaction(() => {
-    conn
-      .prepare(
-        `INSERT INTO sources (id, title, kind, filename, added_at, chars, chunks, questions, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'ready')`,
-      )
-      .run(id, input.title, input.kind, input.filename, now, chars, chunks.length);
-    chunks.forEach((chunk, idx) => {
+  await tx(async (t) => {
+    await t.run(
+      `INSERT INTO sources (id, title, kind, filename, added_at, chars, chunks, questions, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'ready')`,
+      [id, input.title, input.kind, input.filename, now, chars, chunks.length],
+    );
+    for (const [idx, chunk] of chunks.entries()) {
       const chunkId = `${id}:${idx}`;
-      insertChunk.run(chunkId, id, idx, chunk.ref, chunk.text);
-      insertFts.run(chunk.text, chunkId, id);
-    });
-  })();
+      await t.run("INSERT INTO chunks (id, source_id, idx, ref, text) VALUES (?, ?, ?, ?, ?)", [
+        chunkId,
+        id,
+        idx,
+        chunk.ref,
+        chunk.text,
+      ]);
+      await t.run("INSERT INTO chunks_fts (text, chunk_id, source_id) VALUES (?, ?, ?)", [chunk.text, chunkId, id]);
+    }
+  });
 
   return { id, chunks: chunks.length, chars };
 }
 
-export function listSources(): SourceSummary[] {
-  ready();
-  const rows = db().prepare("SELECT * FROM sources ORDER BY added_at DESC").all() as SourceRow[];
+export async function listSources(): Promise<SourceSummary[]> {
+  await ready();
+  const rows = await all<SourceRow>("SELECT * FROM sources ORDER BY added_at DESC");
   return rows.map((r) => ({
     id: r.id,
     title: r.title,
@@ -106,27 +107,26 @@ export function listSources(): SourceSummary[] {
   }));
 }
 
-export function deleteSource(id: string): void {
-  ready();
-  const conn = db();
-  conn.transaction(() => {
-    conn.prepare("DELETE FROM questions WHERE source_id = ?").run(id);
-    conn.prepare("DELETE FROM chunks_fts WHERE source_id = ?").run(id);
-    conn.prepare("DELETE FROM chunks WHERE source_id = ?").run(id);
-    conn.prepare("DELETE FROM sources WHERE id = ?").run(id);
-  })();
+export async function deleteSource(id: string): Promise<void> {
+  await ready();
+  await tx(async (t) => {
+    await t.run("DELETE FROM questions WHERE source_id = ?", [id]);
+    await t.run("DELETE FROM chunks_fts WHERE source_id = ?", [id]);
+    await t.run("DELETE FROM chunks WHERE source_id = ?", [id]);
+    await t.run("DELETE FROM sources WHERE id = ?", [id]);
+  });
 }
 
-export function refreshQuestionCount(sourceId: string): number {
-  const conn = db();
-  const n = (conn.prepare("SELECT COUNT(*) AS n FROM questions WHERE source_id = ?").get(sourceId) as { n: number }).n;
-  conn.prepare("UPDATE sources SET questions = ? WHERE id = ?").run(n, sourceId);
+export async function refreshQuestionCount(sourceId: string): Promise<number> {
+  const row = await get<{ n: number }>("SELECT COUNT(*) AS n FROM questions WHERE source_id = ?", [sourceId]);
+  const n = row?.n ?? 0;
+  await run("UPDATE sources SET questions = ? WHERE id = ?", [n, sourceId]);
   return n;
 }
 
 /** Plain full-text search over imported material — used before any model is considered. */
-export function searchChunks(query: string, sourceId?: string, limit = 8) {
-  ready();
+export async function searchChunks(query: string, sourceId?: string, limit = 8) {
+  await ready();
   const safe = query.replace(/["']/g, " ").trim();
   if (!safe) return [];
   const sql = sourceId
@@ -136,7 +136,7 @@ export function searchChunks(query: string, sourceId?: string, limit = 8) {
        FROM chunks_fts WHERE chunks_fts MATCH ? LIMIT ?`;
   const params = sourceId ? [safe, sourceId, limit] : [safe, limit];
   try {
-    return db().prepare(sql).all(...params) as { chunk_id: string; source_id: string; snippet: string }[];
+    return await all<{ chunk_id: string; source_id: string; snippet: string }>(sql, params);
   } catch {
     return [];
   }

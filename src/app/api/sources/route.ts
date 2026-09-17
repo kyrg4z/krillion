@@ -10,7 +10,7 @@ export const dynamic = "force-dynamic";
 const MAX_BYTES = 40 * 1024 * 1024;
 
 export async function GET() {
-  return NextResponse.json({ sources: listSources(), ai: aiConfig() });
+  return NextResponse.json({ sources: await listSources(), ai: aiConfig() });
 }
 
 export async function POST(request: Request) {
@@ -47,9 +47,9 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "No readable text was found in that file." }, { status: 422 });
     }
 
-    const { id, chunks } = addSource({ title: finalTitle, kind, filename, sections });
+    const { id, chunks } = await addSource({ title: finalTitle, kind, filename, sections });
     // Deterministic generation runs immediately and costs nothing.
-    const stored = storeGenerated(id, finalTitle, generateFromSource(id));
+    const stored = await storeGenerated(id, finalTitle, await generateFromSource(id));
 
     return NextResponse.json({ id, title: finalTitle, chunks, questions: stored });
   } catch (error) {

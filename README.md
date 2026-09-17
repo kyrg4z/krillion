@@ -13,8 +13,31 @@ npm install
 npm run dev        # http://localhost:3000
 ```
 
-The question bank loads itself into SQLite (`data/krillion.db`) the first time the app touches the database.
-Nothing else is needed to play.
+The question bank loads itself into the database the first time the app touches it. Locally that database is
+a SQLite file at `data/krillion.db`, created on first run. Nothing else is needed to play.
+
+## Deploying
+
+Storage is [libSQL](https://github.com/tursodatabase/libsql). Locally it is a plain file; deployed it has to be
+a hosted database, because serverless hosts (Vercel among them) give each request a read-only filesystem and a
+container that is thrown away — a SQLite file there cannot be written to, let alone kept.
+
+Create a database and set two environment variables on the host:
+
+```bash
+turso db create krillion
+turso db show krillion --url          # -> TURSO_DATABASE_URL
+turso db tokens create krillion       # -> TURSO_AUTH_TOKEN
+```
+
+The schema and the question bank are applied on the first request, so there is no migration step. To seed
+ahead of time instead:
+
+```bash
+TURSO_DATABASE_URL=... TURSO_AUTH_TOKEN=... npm run seed
+```
+
+Progress, rounds, mastery and imported material then live in that database and survive every deploy.
 
 ## Playing
 
@@ -51,7 +74,7 @@ into questions locally, keeping the page or chapter reference so you can find th
 ## AI
 
 **The game never calls a model.** Question selection, scoring, timing, streaks, mastery and statistics are all
-plain code against SQLite. The only place a model can be used at all is an optional extra pass over imported
+plain code against SQL. The only place a model can be used at all is an optional extra pass over imported
 documents, and it is off unless you turn it on:
 
 ```bash
@@ -77,6 +100,7 @@ what you keep getting wrong.
 ```
 src/lib/questions/   the authored question bank, one file per category (plus short.ts for typed answers)
 src/lib/grade.ts     answer matching: normalise, alias, then one typo per five characters
+src/lib/db.ts        libSQL connection, schema and the query helpers everything else uses
 src/lib/engine.ts    round construction, scoring, streaks, mastery, spaced review
 src/lib/stats.ts     progress read models
 src/lib/extract.ts   PDF / EPUB / Markdown / text parsing
@@ -93,3 +117,6 @@ and again per round. After editing, re-sync:
 ```bash
 npm run seed
 ```
+
+That writes to whichever database the environment points at — the local file by default, or the hosted one
+when `TURSO_DATABASE_URL` is set.

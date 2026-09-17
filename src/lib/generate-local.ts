@@ -1,4 +1,4 @@
-import { db } from "./db";
+import { all, get, tx } from "./db";
 import { ready } from "./seed-loader";
 import { fingerprint } from "./seed-loader";
 import { refreshQuestionCount } from "./sources";
@@ -78,10 +78,10 @@ function pickDistractors(answer: string, pool: string[], rand: () => number, con
 }
 
 /** Short imports rarely contain four comparable terms, so borrow from the rest of the library. */
-function corpusPool(excludeSourceId: string, limit = 250): string[] {
-  const rows = db()
-    .prepare("SELECT text FROM chunks WHERE source_id != ? LIMIT 400")
-    .all(excludeSourceId) as { text: string }[];
+async function corpusPool(excludeSourceId: string, limit = 250): Promise<string[]> {
+  const rows = await all<{ text: string }>("SELECT text FROM chunks WHERE source_id != ? LIMIT 400", [
+    excludeSourceId,
+  ]);
   const set = new Set<string>();
   for (const row of rows) {
     for (const term of terms(row.text)) {
@@ -105,15 +105,15 @@ export type GeneratedQuestion = {
  * Builds questions from imported material with plain string work — no model,
  * no network, no tokens. Quality gates are strict so weak candidates are dropped.
  */
-export function generateFromSource(sourceId: string, limit = 60): GeneratedQuestion[] {
-  ready();
-  const chunks = db()
-    .prepare("SELECT id, idx, ref, text FROM chunks WHERE source_id = ? ORDER BY idx")
-    .all(sourceId) as Chunk[];
+export async function generateFromSource(sourceId: string, limit = 60): Promise<GeneratedQuestion[]> {
+  await ready();
+  const chunks = await all<Chunk>("SELECT id, idx, ref, text FROM chunks WHERE source_id = ? ORDER BY idx", [
+    sourceId,
+  ]);
   if (chunks.length === 0) return [];
 
   let pool = [...new Set(chunks.flatMap((c) => terms(c.text)))];
-  if (pool.length < 10) pool = [...new Set([...pool, ...corpusPool(sourceId)])];
+  if (pool.length < 10) pool = [...new Set([...pool, ...(await corpusPool(sourceId))])];
   if (pool.length < 3) return [];
 
   const rand = mulberry32(hashSeed(sourceId));
@@ -171,27 +171,26 @@ export function generateFromSource(sourceId: string, limit = 60): GeneratedQuest
   return out;
 }
 
-export function storeGenerated(
+export async function storeGenerated(
   sourceId: string,
   sourceTitle: string,
   questions: GeneratedQuestion[],
   origin: "import" | "ai" = "import",
-): number {
-  const conn = db();
+): Promise<number> {
   const now = Date.now();
-  const insert = conn.prepare(`
+  const insert = `
     INSERT INTO questions (id, category, topic, difficulty, kind, prompt, options, answer, aliases, explanation, deeper, source_id, source_ref, origin, fingerprint, created_at)
     VALUES (@id, 'general', @topic, @difficulty, 'mc', @prompt, @options, @answer, '[]', @explanation, '[]', @source_id, @source_ref, @origin, @fingerprint, @created_at)
     ON CONFLICT(id) DO NOTHING
-  `);
-  const exists = conn.prepare("SELECT 1 FROM questions WHERE fingerprint = ? LIMIT 1");
+  `;
 
-  let stored = 0;
-  conn.transaction(() => {
-    questions.forEach((q, i) => {
+  const stored = await tx(async (t) => {
+    let n = 0;
+    for (const [i, q] of questions.entries()) {
       const fp = fingerprint(q.prompt);
-      if (exists.get(fp)) return;
-      insert.run({
+      const clash = await t.get("SELECT 1 FROM questions WHERE fingerprint = ? LIMIT 1", [fp]);
+      if (clash) continue;
+      await t.run(insert, {
         id: `${sourceId}:${fp}`,
         topic: sourceTitle.slice(0, 48),
         difficulty: q.difficulty,
@@ -205,9 +204,10 @@ export function storeGenerated(
         fingerprint: fp,
         created_at: now + i,
       });
-      stored++;
-    });
-  })();
-  refreshQuestionCount(sourceId);
+      n++;
+    }
+    return n;
+  });
+  await refreshQuestionCount(sourceId);
   return stored;
 }

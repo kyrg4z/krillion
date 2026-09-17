@@ -1,14 +1,20 @@
-import Database from "better-sqlite3";
+import { createClient, type Client, type InArgs, type Transaction } from "@libsql/client";
 import fs from "node:fs";
 import path from "node:path";
 
+/**
+ * Storage is libSQL. In production that is a hosted Turso database reached over
+ * HTTP — serverless hosts give each request a read-only filesystem, so a local
+ * SQLite file cannot hold progress there. Local development falls back to a
+ * plain file so nothing extra is needed to run the app.
+ */
+const REMOTE_URL = process.env.TURSO_DATABASE_URL ?? "";
+const AUTH_TOKEN = process.env.TURSO_AUTH_TOKEN ?? "";
 const DATA_DIR = process.env.KRILLION_DATA_DIR ?? path.join(process.cwd(), "data");
-const DB_PATH = path.join(DATA_DIR, "krillion.db");
 
+// PRAGMAs are deliberately absent: the hosted server owns journalling, and the
+// schema declares no foreign keys.
 const SCHEMA = `
-PRAGMA journal_mode = WAL;
-PRAGMA foreign_keys = ON;
-
 CREATE TABLE IF NOT EXISTS questions (
   id           TEXT PRIMARY KEY,
   category     TEXT NOT NULL,
@@ -150,34 +156,112 @@ CREATE TABLE IF NOT EXISTS meta (
 INSERT OR IGNORE INTO profile (id) VALUES (1);
 `;
 
-type Conn = Database.Database;
+const g = globalThis as unknown as {
+  __krillionClient?: Client;
+  __krillionSchema?: Promise<void>;
+};
 
-const g = globalThis as unknown as { __krillionDb?: Conn };
+function client(): Client {
+  if (g.__krillionClient) return g.__krillionClient;
 
-function open(): Conn {
+  if (REMOTE_URL) {
+    g.__krillionClient = createClient({ url: REMOTE_URL, authToken: AUTH_TOKEN || undefined });
+    return g.__krillionClient;
+  }
+
+  // Falling back to a file on a serverless host would fail later, deep in a
+  // request, with an unreadable EROFS. Say what is actually missing instead.
+  if (process.env.VERCEL) {
+    throw new Error(
+      "TURSO_DATABASE_URL is not set. A deployed build stores progress in a hosted " +
+        "libSQL database; set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN in the project's " +
+        "environment variables and redeploy.",
+    );
+  }
+
+  // Local file mode, for development, where the working directory is writable.
   fs.mkdirSync(DATA_DIR, { recursive: true });
-  const conn = new Database(DB_PATH);
-  conn.pragma("busy_timeout = 5000");
-  conn.exec(SCHEMA);
+  g.__krillionClient = createClient({ url: `file:${path.join(DATA_DIR, "krillion.db")}` });
+  return g.__krillionClient;
+}
+
+/** Applies the schema once per process, and retries on the next call if it fails. */
+async function migrated(conn: Client): Promise<void> {
+  if (!g.__krillionSchema) {
+    g.__krillionSchema = conn.executeMultiple(SCHEMA).catch((error: unknown) => {
+      g.__krillionSchema = undefined;
+      throw error;
+    });
+  }
+  await g.__krillionSchema;
+}
+
+export async function db(): Promise<Client> {
+  const conn = client();
+  await migrated(conn);
   return conn;
 }
 
-export function db(): Conn {
-  if (!g.__krillionDb) g.__krillionDb = open();
-  return g.__krillionDb;
+/** Every row of a query. */
+export async function all<T>(sql: string, args: InArgs = []): Promise<T[]> {
+  const conn = await db();
+  const result = await conn.execute({ sql, args });
+  return result.rows as unknown as T[];
 }
 
-export function getMeta(key: string): string | null {
-  const row = db().prepare("SELECT value FROM meta WHERE key = ?").get(key) as
-    | { value: string }
-    | undefined;
+/** The first row, or undefined. */
+export async function get<T>(sql: string, args: InArgs = []): Promise<T | undefined> {
+  const rows = await all<T>(sql, args);
+  return rows[0];
+}
+
+/** A statement whose rows are not needed. */
+export async function run(sql: string, args: InArgs = []): Promise<void> {
+  const conn = await db();
+  await conn.execute({ sql, args });
+}
+
+/** The same three helpers, bound to an open transaction. */
+export type Tx = {
+  all<T>(sql: string, args?: InArgs): Promise<T[]>;
+  get<T>(sql: string, args?: InArgs): Promise<T | undefined>;
+  run(sql: string, args?: InArgs): Promise<void>;
+};
+
+function bind(tx: Transaction): Tx {
+  const rows = async <T>(sql: string, args: InArgs = []) =>
+    (await tx.execute({ sql, args })).rows as unknown as T[];
+  return {
+    all: rows,
+    get: async <T>(sql: string, args: InArgs = []) => (await rows<T>(sql, args))[0],
+    run: async (sql: string, args: InArgs = []) => {
+      await tx.execute({ sql, args });
+    },
+  };
+}
+
+/** Runs a write transaction, rolling back if the body throws. */
+export async function tx<T>(body: (t: Tx) => Promise<T>): Promise<T> {
+  const conn = await db();
+  const transaction = await conn.transaction("write");
+  try {
+    const out = await body(bind(transaction));
+    await transaction.commit();
+    return out;
+  } catch (error) {
+    await transaction.rollback().catch(() => {});
+    throw error;
+  }
+}
+
+export async function getMeta(key: string): Promise<string | null> {
+  const row = await get<{ value: string }>("SELECT value FROM meta WHERE key = ?", [key]);
   return row?.value ?? null;
 }
 
-export function setMeta(key: string, value: string): void {
-  db()
-    .prepare("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
-    .run(key, value);
+export async function setMeta(key: string, value: string): Promise<void> {
+  await run(
+    "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    [key, value],
+  );
 }
-
-export const DATA_DIRECTORY = DATA_DIR;

@@ -1,7 +1,10 @@
 import crypto from "node:crypto";
-import { db, getMeta, setMeta } from "./db";
+import type { InStatement } from "@libsql/client";
+import { db, get, getMeta, setMeta } from "./db";
 import { SEED_BANK, SEED_VERSION, shortQuestions } from "./questions";
 import type { CategoryId, DeeperStep, SeedQuestion } from "./types";
+
+const SEED_BATCH = 100;
 
 /** Stable per-question shuffle so the correct choice is not always in one slot. */
 function deterministicOrder(seed: string, n: number): number[] {
@@ -43,36 +46,39 @@ function buildDeeper(q: SeedQuestion): DeeperStep[] {
  * Loads the authored bank into SQLite. Deterministic, idempotent, offline.
  * Re-running only rewrites rows whose content actually changed.
  */
-export function ensureSeeded(force = false): number {
-  const conn = db();
-  const already = getMeta("seed_version");
-  const count = (conn.prepare("SELECT COUNT(*) AS n FROM questions WHERE origin = 'seed'").get() as { n: number }).n;
+export async function ensureSeeded(force = false): Promise<number> {
+  const conn = await db();
+  const already = await getMeta("seed_version");
+  const count = await seedCount();
   if (!force && already === SEED_VERSION && count > 0) return count;
 
-  const insert = conn.prepare(`
+  const insert = `
     INSERT INTO questions (id, category, topic, difficulty, kind, prompt, options, answer, aliases, explanation, deeper, source_id, source_ref, origin, fingerprint, created_at)
     VALUES (@id, @category, @topic, @difficulty, 'mc', @prompt, @options, @answer, '[]', @explanation, @deeper, NULL, NULL, 'seed', @fingerprint, @created_at)
     ON CONFLICT(id) DO UPDATE SET
       category = excluded.category, topic = excluded.topic, difficulty = excluded.difficulty,
       prompt = excluded.prompt, options = excluded.options, answer = excluded.answer,
       explanation = excluded.explanation, deeper = excluded.deeper, fingerprint = excluded.fingerprint
-  `);
+  `;
 
-  const insertShort = conn.prepare(`
+  const insertShort = `
     INSERT INTO questions (id, category, topic, difficulty, kind, prompt, options, answer, aliases, explanation, deeper, source_id, source_ref, origin, fingerprint, created_at)
     VALUES (@id, @category, @topic, @difficulty, 'short', @prompt, '[]', @answer, @aliases, @explanation, '[]', NULL, NULL, 'seed', @fingerprint, @created_at)
     ON CONFLICT(id) DO UPDATE SET
       category = excluded.category, topic = excluded.topic, difficulty = excluded.difficulty,
       prompt = excluded.prompt, answer = excluded.answer, aliases = excluded.aliases,
       explanation = excluded.explanation, fingerprint = excluded.fingerprint
-  `);
+  `;
 
   const now = Date.now();
-  const run = conn.transaction(() => {
-    for (const [category, list] of Object.entries(SEED_BANK) as [CategoryId, SeedQuestion[]][]) {
-      for (const q of list) {
-        const { options, answer } = shuffleChoices(q.id, q.a);
-        insert.run({
+  const statements: InStatement[] = [];
+
+  for (const [category, list] of Object.entries(SEED_BANK) as [CategoryId, SeedQuestion[]][]) {
+    for (const q of list) {
+      const { options, answer } = shuffleChoices(q.id, q.a);
+      statements.push({
+        sql: insert,
+        args: {
           id: q.id,
           category,
           topic: q.topic,
@@ -84,11 +90,14 @@ export function ensureSeeded(force = false): number {
           deeper: JSON.stringify(buildDeeper(q)),
           fingerprint: fingerprint(q.q),
           created_at: now,
-        });
-      }
+        },
+      });
     }
-    for (const q of shortQuestions) {
-      insertShort.run({
+  }
+  for (const q of shortQuestions) {
+    statements.push({
+      sql: insertShort,
+      args: {
         id: q.id,
         category: q.category,
         topic: q.topic,
@@ -99,19 +108,35 @@ export function ensureSeeded(force = false): number {
         explanation: q.why,
         fingerprint: fingerprint(q.q),
         created_at: now,
-      });
-    }
-  });
-  run();
-  setMeta("seed_version", SEED_VERSION);
-  return (conn.prepare("SELECT COUNT(*) AS n FROM questions WHERE origin = 'seed'").get() as { n: number }).n;
+      },
+    });
+  }
+
+  // Sent in chunks: one round trip per statement would make a cold start crawl,
+  // and every statement is idempotent, so a partial run is safe to repeat.
+  for (let i = 0; i < statements.length; i += SEED_BATCH) {
+    await conn.batch(statements.slice(i, i + SEED_BATCH), "write");
+  }
+  await setMeta("seed_version", SEED_VERSION);
+  return seedCount();
 }
 
-const g = globalThis as unknown as { __krillionReady?: boolean };
+async function seedCount(): Promise<number> {
+  const row = await get<{ n: number }>("SELECT COUNT(*) AS n FROM questions WHERE origin = 'seed'");
+  return row?.n ?? 0;
+}
+
+const g = globalThis as unknown as { __krillionReady?: Promise<void> };
 
 /** Call at the top of any server entry point that touches the database. */
-export function ready(): void {
-  if (g.__krillionReady) return;
-  ensureSeeded();
-  g.__krillionReady = true;
+export async function ready(): Promise<void> {
+  if (!g.__krillionReady) {
+    g.__krillionReady = ensureSeeded()
+      .then(() => undefined)
+      .catch((error: unknown) => {
+        g.__krillionReady = undefined;
+        throw error;
+      });
+  }
+  await g.__krillionReady;
 }

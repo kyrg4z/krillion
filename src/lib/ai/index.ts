@@ -1,4 +1,4 @@
-import { db } from "../db";
+import { all, run } from "../db";
 import { hashSeed, mulberry32, shuffle } from "../rng";
 import type { GeneratedQuestion } from "../generate-local";
 
@@ -64,14 +64,13 @@ export async function generateWithAi(
 
   const batchSize = opts.batchSize ?? 4;
   const maxBatches = opts.maxBatches ?? 6;
-  const conn = db();
-  const chunks = conn
-    .prepare("SELECT id, ref, text FROM chunks WHERE source_id = ? AND used = 0 ORDER BY idx LIMIT ?")
-    .all(sourceId, batchSize * maxBatches) as { id: string; ref: string | null; text: string }[];
+  const chunks = await all<{ id: string; ref: string | null; text: string }>(
+    "SELECT id, ref, text FROM chunks WHERE source_id = ? AND used = 0 ORDER BY idx LIMIT ?",
+    [sourceId, batchSize * maxBatches],
+  );
   if (chunks.length === 0) return [];
 
   const provider = await loadProvider();
-  const markUsed = conn.prepare("UPDATE chunks SET used = 1 WHERE id = ?");
   const out: GeneratedQuestion[] = [];
 
   for (let i = 0; i < chunks.length; i += batchSize) {
@@ -101,7 +100,7 @@ export async function generateWithAi(
         difficulty: ([1, 2, 3].includes(Number(raw.d)) ? Number(raw.d) : 2) as 1 | 2 | 3,
       });
     }
-    conn.transaction(() => batch.forEach((c) => markUsed.run(c.id)))();
+    for (const c of batch) await run("UPDATE chunks SET used = 1 WHERE id = ?", [c.id]);
   }
 
   return out;

@@ -6,5 +6,5 @@
  */
 import { ensureSeeded } from "../src/lib/seed-loader.ts";
 
-const count = ensureSeeded(true);
+const count = await ensureSeeded(true);
 console.log(`Seed bank synced: ${count} questions.`);

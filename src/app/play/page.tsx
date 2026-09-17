@@ -22,8 +22,8 @@ export default async function Play({
   let opening: { sessionId: string; length: number; question: ServedQuestion } | null = null;
   let openingError: string | null = null;
   try {
-    const { sessionId, length } = startSession({ mode, category, sourceId });
-    const question = serveQuestion(sessionId, 0);
+    const { sessionId, length } = await startSession({ mode, category, sourceId });
+    const question = await serveQuestion(sessionId, 0);
     if (!question) throw new Error("That round came out empty.");
     opening = { sessionId, length, question };
   } catch (error) {

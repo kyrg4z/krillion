@@ -26,7 +26,7 @@ export default async function Library() {
         that keep their page or chapter reference.
       </p>
 
-      <LibraryClient sources={listSources()} ai={aiConfig()} />
+      <LibraryClient sources={await listSources()} ai={aiConfig()} />
     </main>
   );
 }
